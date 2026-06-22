@@ -94,8 +94,8 @@ COLUMN_HELP = {
     "Annualized Risk-Free Return": "Geometrically annualized Ken French risk-free return over the matched sample.",
     "Arithmetic Annualized Excess Return": "Average periodic excess return multiplied by the number of periods per year.",
     "R-Squared": "Share of variation in excess returns explained by the regression.",
-    "Start Date": "First overlapping observation used in the analysis.",
-    "End Date": "Last overlapping observation used in the analysis.",
+    "First Return Date": "First overlapping return observation used in the analysis.",
+    "Last Return Date": "Last overlapping return observation used in the analysis.",
     "Style Consistency Score": "A higher score indicates that the rolling factor exposure has been more stable.",
     "Assessment": "Stable is 0.80 or higher, Watch is 0.70 to 0.79, and Style drift is below 0.70.",
     "Average Beta": "Average rolling sensitivity to the factor.",
@@ -136,7 +136,7 @@ st.caption(
 )
 st.caption(
     "Analyze a fund or portfolio with yfinance price histories, auto-downloaded "
-    "Fama-French factors, rolling exposure analysis, and bt risk/return diagnostics."
+    "Fama-French factors, rolling exposure analysis, and backtested risk/return diagnostics."
 )
 st.warning(
     "**Important disclosure:** This application is provided for educational and informational purposes only "
@@ -160,8 +160,10 @@ with st.sidebar:
     default_factor_index = 0 if len(factor_model_options) == 1 else 1
     factor_model = st.selectbox("Fama-French model", factor_model_options, index=default_factor_index)
     rolling_window = st.slider("Rolling window length", min_value=12, max_value=60, value=24, step=6)
-    start_date = st.date_input("Start date", value=pd.Timestamp("2018-01-01"))
-    end_date = st.date_input("End date", value=pd.Timestamp.today().normalize())
+    start_date = st.date_input("Analysis start date", value=pd.Timestamp("2018-01-01"))
+    end_date = st.date_input("Analysis end date", value=pd.Timestamp.today().normalize())
+    st.caption("We download an earlier price when needed to calculate the first return in your selected period.")
+    period_status_sidebar = st.empty()
     risk_free_sidebar = st.empty()
     st.link_button(
         "Ken French Data Library",
@@ -171,6 +173,20 @@ with st.sidebar:
 
 
 periods_per_year = {"Monthly": 12, "Weekly": 52, "Daily": 252}[frequency]
+selected_start = pd.Timestamp(start_date)
+selected_end = pd.Timestamp(end_date)
+if selected_start > selected_end:
+    st.error("Analysis start date must be on or before analysis end date.")
+    st.stop()
+
+price_lookback = {
+    "Monthly": pd.DateOffset(months=1, days=7),
+    "Weekly": pd.DateOffset(days=10),
+    "Daily": pd.DateOffset(days=10),
+}[frequency]
+price_download_start = selected_start - price_lookback
+# yfinance treats end as exclusive, so request the following day.
+price_download_end = selected_end + pd.DateOffset(days=1)
 
 st.info(
     "You can analyze a single fund ticker or a weighted portfolio built from holdings. "
@@ -216,7 +232,9 @@ try:
         if not ticker_input:
             st.warning("Enter a ticker to download returns.")
             st.stop()
-        price_history = fetch_price_history([ticker_input], str(start_date), str(end_date), frequency)
+        price_history = fetch_price_history(
+            [ticker_input], str(price_download_start.date()), str(price_download_end.date()), frequency
+        )
         price_returns = price_history.pct_change().dropna(how="all")
         returns_df = pd.DataFrame({"Date": price_returns.index, ticker_input: price_returns[ticker_input].values})
         source_description = f"Downloaded return history for `{ticker_input}` from yfinance."
@@ -226,7 +244,12 @@ try:
         else:
             holdings_map = parse_holdings_text(holdings_text)
 
-        price_history = fetch_price_history(list(holdings_map.keys()), str(start_date), str(end_date), frequency)
+        price_history = fetch_price_history(
+            list(holdings_map.keys()),
+            str(price_download_start.date()),
+            str(price_download_end.date()),
+            frequency,
+        )
         returns_df = build_portfolio_returns_from_prices(price_history, holdings_map, portfolio_name=portfolio_name)
         source_description = f"Built `{portfolio_name}` from {len(holdings_map)} holdings using yfinance price history."
     else:
@@ -255,10 +278,13 @@ except Exception as exc:
 returns_df = normalize_returns_frame(returns_df)
 factors_df = normalize_returns_frame(factors_df)
 
-selected_start = pd.Timestamp(start_date)
-selected_end = pd.Timestamp(end_date)
 returns_df = returns_df[returns_df["Date"].between(selected_start, selected_end)].copy()
 factors_df = factors_df[factors_df["Date"].between(selected_start, selected_end)].copy()
+
+target_first_available = returns_df["Date"].min() if not returns_df.empty else pd.NaT
+target_last_available = returns_df["Date"].max() if not returns_df.empty else pd.NaT
+factor_first_available = factors_df["Date"].min() if not factors_df.empty else pd.NaT
+factor_last_available = factors_df["Date"].max() if not factors_df.empty else pd.NaT
 
 target_candidates = [column for column in returns_df.columns if column != "Date"]
 factor_candidates = [column for column in factors_df.columns if column != "Date"]
@@ -308,6 +334,52 @@ except Exception as exc:
 if len(frame) <= len(factor_columns) + 2:
     st.error("Not enough overlapping observations to run a stable regression.")
     st.stop()
+
+actual_start = frame["Date"].min()
+actual_end = frame["Date"].max()
+if frequency == "Monthly":
+    expected_first_return = selected_start + pd.offsets.MonthEnd(0)
+    expected_last_return = selected_end + pd.offsets.MonthEnd(0)
+    if expected_last_return > selected_end:
+        expected_last_return -= pd.offsets.MonthEnd(1)
+elif frequency == "Weekly":
+    expected_first_return = selected_start.to_period("W-FRI").end_time.normalize()
+    expected_last_return = selected_end.to_period("W-FRI").end_time.normalize()
+    if expected_last_return > selected_end:
+        expected_last_return -= pd.DateOffset(days=7)
+else:
+    expected_first_return = selected_start
+    expected_last_return = selected_end
+
+date_limit_notes = []
+if actual_start > expected_first_return:
+    start_limiter = (
+        "Fama–French factor data"
+        if pd.notna(factor_first_available)
+        and (pd.isna(target_first_available) or factor_first_available >= target_first_available)
+        else "target return data"
+    )
+    date_limit_notes.append(f"The first matched return is limited by {start_limiter}.")
+if actual_end < expected_last_return:
+    end_limiter = (
+        "Fama–French factor data"
+        if pd.notna(factor_last_available)
+        and (pd.isna(target_last_available) or factor_last_available <= target_last_available)
+        else "target return data"
+    )
+    date_limit_notes.append(f"The last matched return is limited by {end_limiter}.")
+
+frequency_note = f"{frequency} returns are labeled by their period-ending date."
+period_status = (
+    f"**Requested period:** {selected_start:%Y-%m-%d} to {selected_end:%Y-%m-%d}  \n"
+    f"**Actual matched returns:** {actual_start:%Y-%m-%d} to {actual_end:%Y-%m-%d}  \n"
+    f"{frequency_note}"
+)
+if date_limit_notes:
+    period_status += "  \n" + " ".join(date_limit_notes)
+    period_status_sidebar.warning(period_status)
+else:
+    period_status_sidebar.info(period_status)
 
 result = run_factor_regression(frame, factor_columns, periods_per_year)
 rolling_betas = compute_rolling_betas(frame, factor_columns, rolling_window)
@@ -421,7 +493,7 @@ with tab1:
     factor_return_display = format_dataframe(
         factor_return_summary,
         percent_cols=factor_return_percent_cols,
-        date_cols=["Start Date", "End Date"],
+        date_cols=["First Return Date", "Last Return Date"],
     )
     show_table(factor_return_display)
 
@@ -434,11 +506,11 @@ with tab1:
 
 with tab2:
     st.subheader("Risk and Return Attribution", help="Separates total return and risk into market, factor, alpha, and unexplained components.")
-    attribution_percent_cols = [column for column in risk_return_attribution.columns if column not in ["Target", "Start Date", "End Date"]]
+    attribution_percent_cols = [column for column in risk_return_attribution.columns if column not in ["Target", "First Return Date", "Last Return Date"]]
     risk_return_display = format_dataframe(
         risk_return_attribution,
         percent_cols=attribution_percent_cols,
-        date_cols=["Start Date", "End Date"],
+        date_cols=["First Return Date", "Last Return Date"],
     )
     show_table(risk_return_display)
 

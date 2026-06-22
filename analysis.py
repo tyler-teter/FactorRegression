@@ -401,8 +401,8 @@ def compute_factor_return_summary(
 ) -> pd.DataFrame:
     row: dict[str, Any] = {
         "Target": target_column,
-        "Start Date": frame["Date"].min(),
-        "End Date": frame["Date"].max(),
+        "First Return Date": frame["Date"].min(),
+        "Last Return Date": frame["Date"].max(),
         "Annualized Alpha": annualized_alpha,
         "R-Squared": r_squared,
     }
@@ -422,8 +422,8 @@ def compute_risk_return_attribution(
     target_returns = frame[target_column]
     row: dict[str, Any] = {
         "Target": target_column,
-        "Start Date": frame["Date"].min(),
-        "End Date": frame["Date"].max(),
+        "First Return Date": frame["Date"].min(),
+        "Last Return Date": frame["Date"].max(),
         "Cumulative Return": float((1 + target_returns).prod() - 1),
         "Annualized Return": float(annualize_return(target_returns, periods_per_year)),
         "Annualized Volatility": float(target_returns.std(ddof=0) * np.sqrt(periods_per_year)),
@@ -582,6 +582,9 @@ def compute_bt_risk_return_stats(
     result = bt.run(backtest)
     stats = result.stats[[strategy_name]].copy().reset_index()
     stats.columns = ["Metric", "Value"]
+    # bt uses synthetic initialization dates to seed its price index. Replace
+    # those implementation details with the actual return dates users selected.
+    stats = stats[~stats["Metric"].astype(str).str.lower().isin(["start", "end"])]
     stats = stats[
         ~stats["Metric"].astype(str).str.contains("sharpe|sortino", case=False, regex=True)
     ]
@@ -591,7 +594,13 @@ def compute_bt_risk_return_stats(
             "Value": [sharpe, sortino],
         }
     )
-    stats = pd.concat([custom_ratios, stats], ignore_index=True)
+    return_dates = pd.DataFrame(
+        {
+            "Metric": ["First Return Date", "Last Return Date"],
+            "Value": [clean.index.min(), clean.index.max()],
+        }
+    )
+    stats = pd.concat([return_dates, custom_ratios, stats], ignore_index=True)
     stats = stats.dropna(subset=["Value"])
     return stats
 
