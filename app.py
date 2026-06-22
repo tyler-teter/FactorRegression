@@ -130,7 +130,10 @@ def polish_chart(fig: go.Figure, hover_format: str = ".2%") -> go.Figure:
 
 
 st.title("Factor Regression Lab")
-st.caption("Built by Tyler Teter, CFP®, CFA")
+st.caption(
+    "Built by Tyler Teter, CFP®, CFA | "
+    "[LinkedIn](https://www.linkedin.com/in/tylerteter/)"
+)
 st.caption(
     "Analyze a fund or portfolio with yfinance price histories, auto-downloaded "
     "Fama-French factors, rolling exposure analysis, and bt risk/return diagnostics."
