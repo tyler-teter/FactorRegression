@@ -1210,3 +1210,63 @@ So if `Mkt-RF` has a beta of `1.10` and the market excess return in a month is `
 If monthly alpha is `0.05%`, that same `0.05%` is added as the alpha contribution for every month in the fitted excess-return line.
 """
     )
+
+    st.subheader(
+        "Style Stability Math",
+        help="Explains how the app classifies rolling factor exposure as stable, watch, or style drift.",
+    )
+    st.markdown(
+        """
+The style profile is based on the rolling beta series for each selected factor. For every rolling window, the app refits the same regression using only the trailing window of observations:
+
+```text
+TargetExcess_t = Alpha_window
+               + Beta_1,window * Factor_1,t
+               + ...
+               + Beta_k,window * Factor_k,t
+               + Residual_t
+```
+
+That creates a time series of rolling betas for each factor:
+
+```text
+Beta_i,1, Beta_i,2, Beta_i,3, ..., Beta_i,T
+```
+
+For each factor, the app measures how much that rolling exposure moves around:
+
+```text
+BetaVolatility_i = standard deviation of the rolling beta series for factor i
+```
+
+Then it converts beta volatility into a style consistency score:
+
+```text
+StyleConsistencyScore_i = 1 / (1 + BetaVolatility_i)
+```
+
+This makes the score easier to read:
+
+```text
+Lower beta volatility -> score closer to 1.00 -> more stable exposure
+Higher beta volatility -> score closer to 0.00 -> less stable exposure
+```
+
+The per-factor classifications are:
+
+```text
+Stable      >= 0.80
+Watch       >= 0.70 and < 0.80
+Style drift < 0.70
+```
+
+The manager due diligence note summarizes the full factor set. It calls the overall style profile relatively stable only when both conditions are true:
+
+```text
+Average style consistency score >= 0.80
+Weakest individual factor score >= 0.70
+```
+
+So a portfolio can have a good average score but still get flagged if one selected factor has a very unstable rolling beta. That is intentional: one jumpy exposure can matter even when the broader factor profile looks calm.
+"""
+    )
