@@ -12,6 +12,24 @@ from pandas_datareader import data as web
 from statsmodels.stats.diagnostic import het_breuschpagan
 from statsmodels.stats.stattools import durbin_watson
 
+AQR_QMJ_FACTORS_URL = "https://www.aqr.com/-/media/AQR/Documents/Insights/Data-Sets/Quality-Minus-Junk-Factors-Monthly.xlsx"
+AQR_BAB_FACTORS_URL = "https://www.aqr.com/-/media/AQR/Documents/Insights/Data-Sets/Betting-Against-Beta-Equity-Factors-Monthly.xlsx"
+
+AQR_REGION_COLUMNS = {
+    "US": "USA",
+    "Developed ex-US": "Global Ex USA",
+}
+
+AQR_FACTOR_SHEETS = {
+    "MKT": (AQR_QMJ_FACTORS_URL, "MKT"),
+    "SMB": (AQR_QMJ_FACTORS_URL, "SMB"),
+    "HML": (AQR_QMJ_FACTORS_URL, "HML FF"),
+    "HML-DEV": (AQR_QMJ_FACTORS_URL, "HML Devil"),
+    "UMD": (AQR_QMJ_FACTORS_URL, "UMD"),
+    "QMJ": (AQR_QMJ_FACTORS_URL, "QMJ Factors"),
+    "BAB": (AQR_BAB_FACTORS_URL, "BAB Factors"),
+}
+
 
 @dataclass
 class RegressionResult:
@@ -176,6 +194,7 @@ def fetch_fama_french_factors(
     frequency: str,
     start_date: str | None = None,
     end_date: str | None = None,
+    include_momentum: bool = False,
 ) -> pd.DataFrame:
     dataset_map = {
         "3 Factor": {
@@ -188,29 +207,133 @@ def fetch_fama_french_factors(
             "Daily": "F-F_Research_Data_5_Factors_2x3_daily",
         },
     }
+    momentum_map = {
+        "Monthly": "F-F_Momentum_Factor",
+        "Daily": "F-F_Momentum_Factor_daily",
+    }
 
     if dataset_name not in dataset_map or frequency not in dataset_map[dataset_name]:
         raise ValueError(f"{dataset_name} factors are not available for {frequency.lower()} frequency.")
+    if include_momentum and frequency not in momentum_map:
+        raise ValueError("The Ken French momentum factor is available in this app for monthly and daily frequency.")
 
-    ff_data = web.DataReader(
-        dataset_map[dataset_name][frequency],
-        "famafrench",
-        start=start_date,
-        end=end_date,
-    )[0].copy()
-    ff_data.index.name = "Date"
-    ff_data = ff_data.reset_index()
+    def read_ken_french_dataset(ken_french_name: str) -> pd.DataFrame:
+        data = web.DataReader(
+            ken_french_name,
+            "famafrench",
+            start=start_date,
+            end=end_date,
+        )[0].copy()
+        data.index.name = "Date"
+        data = data.reset_index()
+        data.columns = [str(column).strip() for column in data.columns]
 
-    if frequency == "Monthly":
-        ff_data["Date"] = ff_data["Date"].dt.to_timestamp("M")
-    else:
-        ff_data["Date"] = pd.to_datetime(ff_data["Date"])
+        if frequency == "Monthly":
+            data["Date"] = data["Date"].dt.to_timestamp("M")
+        else:
+            data["Date"] = pd.to_datetime(data["Date"])
 
-    value_columns = [column for column in ff_data.columns if column != "Date"]
-    for column in value_columns:
-        ff_data[column] = pd.to_numeric(ff_data[column], errors="coerce") / 100
+        value_columns = [column for column in data.columns if column != "Date"]
+        for column in value_columns:
+            data[column] = pd.to_numeric(data[column], errors="coerce") / 100
+
+        return data.dropna().sort_values("Date")
+
+    ff_data = read_ken_french_dataset(dataset_map[dataset_name][frequency])
+
+    if include_momentum:
+        momentum_data = read_ken_french_dataset(momentum_map[frequency])
+        momentum_columns = [column for column in momentum_data.columns if column != "Date"]
+        if not momentum_columns:
+            raise ValueError("The Ken French momentum dataset did not include a usable momentum column.")
+        momentum_column = momentum_columns[0]
+        momentum_data = momentum_data[["Date", momentum_column]].rename(columns={momentum_column: "Mom"})
+        ff_data = ff_data.merge(momentum_data, on="Date", how="inner")
 
     return ff_data.dropna().sort_values("Date")
+
+
+def _read_aqr_factor_sheet(
+    workbook_url: str,
+    sheet_name: str,
+    region_column: str,
+    output_column: str,
+) -> pd.DataFrame:
+    data = pd.read_excel(workbook_url, sheet_name=sheet_name, header=18)
+    data.columns = [str(column).strip() for column in data.columns]
+    if "DATE" not in data.columns or region_column not in data.columns:
+        raise ValueError(f"AQR sheet `{sheet_name}` did not contain the expected `{region_column}` factor column.")
+
+    result = data[["DATE", region_column]].copy()
+    result.columns = ["Date", output_column]
+    result["Date"] = pd.to_datetime(result["Date"], errors="coerce")
+    result[output_column] = pd.to_numeric(result[output_column], errors="coerce")
+    return result.dropna().sort_values("Date")
+
+
+def fetch_aqr_equity_factors(
+    selected_factors_by_region: dict[str, list[str]],
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    selected_start = pd.Timestamp(start_date) if start_date else None
+    selected_end = pd.Timestamp(end_date) if end_date else None
+
+    for region_name, selected_factors in selected_factors_by_region.items():
+        region_column = AQR_REGION_COLUMNS.get(region_name)
+        if region_column is None:
+            raise ValueError(f"Unsupported AQR region `{region_name}`.")
+
+        region_label = "US" if region_name == "US" else "DEV"
+        for factor_name in selected_factors:
+            if factor_name not in AQR_FACTOR_SHEETS:
+                raise ValueError(f"Unsupported AQR factor `{factor_name}`.")
+            workbook_url, sheet_name = AQR_FACTOR_SHEETS[factor_name]
+            output_column = f"AQR {region_label} {factor_name}"
+            frames.append(_read_aqr_factor_sheet(workbook_url, sheet_name, region_column, output_column))
+
+    if not frames:
+        return pd.DataFrame(columns=["Date"])
+
+    result = frames[0]
+    for frame in frames[1:]:
+        result = result.merge(frame, on="Date", how="outer")
+
+    if selected_start is not None:
+        result = result[result["Date"] >= selected_start]
+    if selected_end is not None:
+        result = result[result["Date"] <= selected_end]
+
+    value_columns = [column for column in result.columns if column != "Date"]
+    return result.dropna(how="all", subset=value_columns).sort_values("Date")
+
+
+def compute_fixed_income_factors(
+    risk_free_df: pd.DataFrame,
+    frequency: str,
+    start_date: str,
+    end_date: str,
+    selected_factors: list[str],
+) -> pd.DataFrame:
+    if not selected_factors:
+        return pd.DataFrame(columns=["Date"])
+
+    if "RF" not in risk_free_df.columns:
+        raise ValueError("RF is required to calculate fixed income term risk.")
+
+    prices = fetch_price_history(["VUSTX", "VLTCX"], start_date, end_date, frequency)
+    returns = prices.pct_change().dropna(how="all").reset_index().rename(columns={"index": "Date"})
+    returns["Date"] = pd.to_datetime(returns["Date"])
+
+    merged = returns.merge(risk_free_df[["Date", "RF"]], on="Date", how="inner")
+    result = pd.DataFrame({"Date": merged["Date"]})
+    if "TRM" in selected_factors:
+        result["TRM"] = merged["VUSTX"] - merged["RF"]
+    if "CDT" in selected_factors:
+        result["CDT"] = merged["VLTCX"] - merged["VUSTX"]
+
+    return result.dropna().sort_values("Date")
 
 
 def prepare_analysis_frame(
